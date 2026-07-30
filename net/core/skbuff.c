@@ -79,6 +79,9 @@
 
 struct kmem_cache *skbuff_head_cache __read_mostly;
 static struct kmem_cache *skbuff_fclone_cache __read_mostly;
+#ifdef CONFIG_SKB_EXTENSIONS
+static struct kmem_cache *skbuff_ext_cache __ro_after_init;
+#endif
 int sysctl_max_skb_frags __read_mostly = MAX_SKB_FRAGS;
 EXPORT_SYMBOL(sysctl_max_skb_frags);
 
@@ -630,6 +633,7 @@ void skb_release_head_state(struct sk_buff *skb)
 #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
 	nf_bridge_put(skb->nf_bridge);
 #endif
+	skb_ext_put(skb);
 }
 
 /* Free everything but the sk_buff shell. */
@@ -809,6 +813,7 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
 	new->dev		= old->dev;
 	memcpy(new->cb, old->cb, sizeof(old->cb));
 	skb_dst_copy(new, old);
+	__skb_ext_copy(new, old);
 #ifdef CONFIG_XFRM
 	new->sp			= secpath_get(old->sp);
 #endif
@@ -1314,7 +1319,7 @@ static void skb_headers_offset_update(struct sk_buff *skb, int off)
 	skb->inner_mac_header += off;
 }
 
-static void copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
+void skb_copy_header(struct sk_buff *new, const struct sk_buff *old)
 {
 	__copy_skb_header(new, old);
 
@@ -1322,6 +1327,7 @@ static void copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
 	skb_shinfo(new)->gso_segs = skb_shinfo(old)->gso_segs;
 	skb_shinfo(new)->gso_type = skb_shinfo(old)->gso_type;
 }
+EXPORT_SYMBOL(skb_copy_header);
 
 static inline int skb_alloc_rx_flag(const struct sk_buff *skb)
 {
@@ -1365,7 +1371,7 @@ struct sk_buff *skb_copy(const struct sk_buff *skb, gfp_t gfp_mask)
 	if (skb_copy_bits(skb, -headerlen, n->head, headerlen + skb->len))
 		BUG();
 
-	copy_skb_header(n, skb);
+	skb_copy_header(n, skb);
 	return n;
 }
 EXPORT_SYMBOL(skb_copy);
@@ -1429,7 +1435,7 @@ struct sk_buff *__pskb_copy_fclone(struct sk_buff *skb, int headroom,
 		skb_clone_fraglist(n);
 	}
 
-	copy_skb_header(n, skb);
+	skb_copy_header(n, skb);
 out:
 	return n;
 }
@@ -1521,6 +1527,8 @@ int pskb_expand_head(struct sk_buff *skb, int nhead, int ntail,
 	skb->nohdr    = 0;
 	atomic_set(&skb_shinfo(skb)->dataref, 1);
 
+	skb_metadata_clear(skb);
+
 	/* It is not generally safe to change skb->truesize.
 	 * For the moment, we really care of rx path, or
 	 * when skb is orphaned (not attached to a socket).
@@ -1609,7 +1617,7 @@ struct sk_buff *skb_copy_expand(const struct sk_buff *skb,
 			  skb->len + head_copy_len))
 		BUG();
 
-	copy_skb_header(n, skb);
+	skb_copy_header(n, skb);
 
 	skb_headers_offset_update(n, newheadroom - oldheadroom);
 
@@ -1950,6 +1958,9 @@ void *__pskb_pull_tail(struct sk_buff *skb, int delta)
 				insp = list;
 			} else {
 				/* Eaten partially. */
+				if (skb_is_gso(skb) && !list->head_frag &&
+				    skb_headlen(list))
+					skb_shinfo(skb)->gso_type |= SKB_GSO_DODGY;
 
 				if (skb_shared(list)) {
 					/* Sucks! We need to fork list. :-( */
@@ -1974,7 +1985,7 @@ void *__pskb_pull_tail(struct sk_buff *skb, int delta)
 		/* Free pulled out fragments. */
 		while ((list = skb_shinfo(skb)->frag_list) != insp) {
 			skb_shinfo(skb)->frag_list = list->next;
-			kfree_skb(list);
+			consume_skb(list);
 		}
 		/* And insert new clone at head. */
 		if (clone) {
@@ -3511,6 +3522,20 @@ void *skb_pull_rcsum(struct sk_buff *skb, unsigned int len)
 	return skb->data;
 }
 EXPORT_SYMBOL_GPL(skb_pull_rcsum);
+/* Huaqin modify for HQ-152330 by luocheng at 2021/09/08 start */
+static inline skb_frag_t skb_head_frag_to_page_desc(struct sk_buff *frag_skb)
+{
+	skb_frag_t head_frag;
+	struct page *page;
+
+	page = virt_to_head_page(frag_skb->head);
+	head_frag.page.p = page;
+	head_frag.page_offset = frag_skb->data -
+		(unsigned char *)page_address(page);
+	head_frag.size = skb_headlen(frag_skb);
+	return head_frag;
+}
+/* Huaqin modify for HQ-152330 by luocheng at 2021/09/08 end */
 
 /**
  *	skb_segment - Perform protocol segmentation on skb.
@@ -3544,23 +3569,25 @@ struct sk_buff *skb_segment(struct sk_buff *head_skb,
 	int pos;
 	int dummy;
 
-	if (list_skb && !list_skb->head_frag && skb_headlen(list_skb) &&
-	    (skb_shinfo(head_skb)->gso_type & SKB_GSO_DODGY)) {
-		/* gso_size is untrusted, and we have a frag_list with a linear
-		 * non head_frag head.
-		 *
-		 * (we assume checking the first list_skb member suffices;
-		 * i.e if either of the list_skb members have non head_frag
-		 * head, then the first one has too).
-		 *
-		 * If head_skb's headlen does not fit requested gso_size, it
-		 * means that the frag_list members do NOT terminate on exact
-		 * gso_size boundaries. Hence we cannot perform skb_frag_t page
-		 * sharing. Therefore we must fallback to copying the frag_list
-		 * skbs; we do so by disabling SG.
-		 */
-		if (mss != GSO_BY_FRAGS && mss != skb_headlen(head_skb))
-			features &= ~NETIF_F_SG;
+	if ((skb_shinfo(head_skb)->gso_type & SKB_GSO_DODGY) &&
+	    mss != GSO_BY_FRAGS && mss != skb_headlen(head_skb)) {
+		struct sk_buff *check_skb;
+
+		for (check_skb = list_skb; check_skb; check_skb = check_skb->next) {
+			if (skb_headlen(check_skb) && !check_skb->head_frag) {
+				/* gso_size is untrusted, and we have a frag_list with
+				 * a linear non head_frag item.
+				 *
+				 * If head_skb's headlen does not fit requested gso_size,
+				 * it means that the frag_list members do NOT terminate
+				 * on exact gso_size boundaries. Hence we cannot perform
+				 * skb_frag_t page sharing. Therefore we must fallback to
+				 * copying the frag_list skbs; we do so by disabling SG.
+				 */
+				features &= ~NETIF_F_SG;
+				break;
+			}
+		}
 	}
 
 	__skb_push(head_skb, doffset);
@@ -3605,8 +3632,9 @@ struct sk_buff *skb_segment(struct sk_buff *head_skb,
 		/* GSO partial only requires that we trim off any excess that
 		 * doesn't fit into an MSS sized block, so take care of that
 		 * now.
+		 * Cap len to not accidentally hit GSO_BY_FRAGS.
 		 */
-		partial_segs = len / mss;
+		partial_segs = min(len, (unsigned int)(GSO_BY_FRAGS - 1)) / mss;
 		if (partial_segs > 1)
 			mss *= partial_segs;
 		else
@@ -3731,15 +3759,21 @@ normal:
 
 		while (pos < offset + len) {
 			if (i >= nfrags) {
-				BUG_ON(skb_headlen(list_skb));
 
 				i = 0;
 				nfrags = skb_shinfo(list_skb)->nr_frags;
 				frag = skb_shinfo(list_skb)->frags;
 				frag_skb = list_skb;
-
-				BUG_ON(!nfrags);
-
+			/* Huaqin modify for HQ-152330 by luocheng at 2021/09/08 start */
+				if (!skb_headlen(list_skb)) {
+					BUG_ON(!nfrags);
+				} else {
+					BUG_ON(!list_skb->head_frag);
+					/* to make room for head_frag. */
+					i--;
+					frag--;
+				}
+			/* Huaqin modify for HQ-152330 by luocheng at 2021/09/08 end */
 				list_skb = list_skb->next;
 			}
 
@@ -3756,8 +3790,9 @@ normal:
 				goto err;
 			if (skb_zerocopy_clone(nskb, frag_skb, GFP_ATOMIC))
 				goto err;
-
-			*nskb_frag = *frag;
+			/* Huaqin modify for HQ-152330 by luocheng at 2021/09/08 start */
+			*nskb_frag = (i < 0) ? skb_head_frag_to_page_desc(frag_skb) : *frag;
+			/* Huaqin modify for HQ-152330 by luocheng at 2021/09/08 end */
 			__skb_frag_ref(nskb_frag);
 			size = skb_frag_size(nskb_frag);
 
@@ -3961,6 +3996,38 @@ done:
 }
 EXPORT_SYMBOL_GPL(skb_gro_receive);
 
+#ifdef CONFIG_SKB_EXTENSIONS
+#define SKB_EXT_ALIGN_VALUE	8
+#define SKB_EXT_CHUNKSIZEOF(x)	(ALIGN((sizeof(x)), SKB_EXT_ALIGN_VALUE) / SKB_EXT_ALIGN_VALUE)
+static const u8 skb_ext_type_len[] = {
+#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+	[SKB_EXT_BRIDGE_NF] = SKB_EXT_CHUNKSIZEOF(struct nf_bridge_info),
+#endif
+};
+
+static __always_inline unsigned int skb_ext_total_length(void)
+{
+	return SKB_EXT_CHUNKSIZEOF(struct skb_ext) +
+#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+		skb_ext_type_len[SKB_EXT_BRIDGE_NF] +
+#endif
+		0;
+}
+
+static void skb_extensions_init(void)
+{
+	BUILD_BUG_ON(SKB_EXT_NUM >= 8);
+	BUILD_BUG_ON(skb_ext_total_length() > 255);
+	skbuff_ext_cache = kmem_cache_create("skbuff_ext_cache",
+					     SKB_EXT_ALIGN_VALUE * skb_ext_total_length(),
+					     0,
+					     SLAB_HWCACHE_ALIGN|SLAB_PANIC,
+					     NULL);
+}
+#else
+static void skb_extensions_init(void) {}
+#endif
+
 void __init skb_init(void)
 {
 	skbuff_head_cache = kmem_cache_create("skbuff_head_cache",
@@ -3973,6 +4040,7 @@ void __init skb_init(void)
 						0,
 						SLAB_HWCACHE_ALIGN|SLAB_PANIC,
 						NULL);
+	skb_extensions_init();
 }
 
 static int
@@ -4351,7 +4419,7 @@ static bool skb_may_tx_timestamp(struct sock *sk, bool tsonly)
 {
 	bool ret;
 
-	if (likely(sysctl_tstamp_allow_data || tsonly))
+	if (likely(READ_ONCE(sysctl_tstamp_allow_data) || tsonly))
 		return true;
 
 	read_lock_bh(&sk->sk_callback_lock);
@@ -4414,6 +4482,11 @@ void __skb_tstamp_tx(struct sk_buff *orig_skb,
 			skb = alloc_skb(0, GFP_ATOMIC);
 	} else {
 		skb = skb_clone(orig_skb, GFP_ATOMIC);
+
+		if (skb_orphan_frags_rx(skb, GFP_ATOMIC)) {
+			kfree_skb(skb);
+			return;
+		}
 	}
 	if (!skb)
 		return;
@@ -5410,7 +5483,7 @@ static int pskb_carve_frag_list(struct sk_buff *skb,
 	/* Free pulled out fragments. */
 	while ((list = shinfo->frag_list) != insp) {
 		shinfo->frag_list = list->next;
-		kfree_skb(list);
+		consume_skb(list);
 	}
 	/* And insert new clone at head. */
 	if (clone) {
@@ -5570,3 +5643,113 @@ void skb_condense(struct sk_buff *skb)
 	 */
 	skb->truesize = SKB_TRUESIZE(skb_end_offset(skb));
 }
+
+#ifdef CONFIG_SKB_EXTENSIONS
+static void *skb_ext_get_ptr(struct skb_ext *ext, enum skb_ext_id id)
+{
+	return (void *)ext + (ext->offset[id] * SKB_EXT_ALIGN_VALUE);
+}
+
+static struct skb_ext *skb_ext_alloc(void)
+{
+	struct skb_ext *new = kmem_cache_alloc(skbuff_ext_cache, GFP_ATOMIC);
+
+	if (new) {
+		memset(new->offset, 0, sizeof(new->offset));
+		refcount_set(&new->refcnt, 1);
+	}
+
+	return new;
+}
+
+static struct skb_ext *skb_ext_maybe_cow(struct skb_ext *old)
+{
+	struct skb_ext *new;
+
+	if (refcount_read(&old->refcnt) == 1)
+		return old;
+
+	new = kmem_cache_alloc(skbuff_ext_cache, GFP_ATOMIC);
+	if (!new)
+		return NULL;
+
+	memcpy(new, old, old->chunks * SKB_EXT_ALIGN_VALUE);
+	refcount_set(&new->refcnt, 1);
+	__skb_ext_put(old);
+
+	return new;
+}
+
+/**
+ * skb_ext_add - allocate space for given extension, COW if needed
+ * @skb: buffer
+ * @id: extension to allocate space for
+ *
+ * Allocates enough space for the given extension.
+ * If the extension is already present, a pointer to that extension
+ * is returned.
+ *
+ * If the skb was cloned, COW applies and the returned memory can be
+ * modified without changing the extension space of clones buffers.
+ *
+ * Returns pointer to the extension or NULL on allocation failure.
+ */
+void *skb_ext_add(struct sk_buff *skb, enum skb_ext_id id)
+{
+	struct skb_ext *new, *old = NULL;
+	unsigned int newlen, newoff;
+
+	if (skb->active_extensions) {
+		old = skb->extensions;
+		new = skb_ext_maybe_cow(old);
+		if (!new)
+			return NULL;
+		if (__skb_ext_exist(old, id)) {
+			if (old != new)
+				skb->extensions = new;
+			goto set_active;
+		}
+		newoff = old->chunks;
+	} else {
+		newoff = SKB_EXT_CHUNKSIZEOF(*new);
+		new = skb_ext_alloc();
+		if (!new)
+			return NULL;
+	}
+
+	newlen = newoff + skb_ext_type_len[id];
+	new->chunks = newlen;
+	new->offset[id] = newoff;
+	skb->extensions = new;
+
+set_active:
+	skb->active_extensions |= 1 << id;
+	return skb_ext_get_ptr(new, id);
+}
+
+EXPORT_SYMBOL(skb_ext_add);
+void __skb_ext_del(struct sk_buff *skb, enum skb_ext_id id)
+{
+	struct skb_ext *ext = skb->extensions;
+	skb->active_extensions &= ~(1 << id);
+	if (skb->active_extensions == 0) {
+		skb->extensions = NULL;
+		__skb_ext_put(ext);
+	}
+}
+
+EXPORT_SYMBOL(__skb_ext_del);
+void __skb_ext_put(struct skb_ext *ext)
+{
+	/* If this is last clone, nothing can increment
+	 * it after check passes.  Avoids one atomic op.
+	 */
+	if (refcount_read(&ext->refcnt) == 1)
+		goto free_now;
+	if (!refcount_dec_and_test(&ext->refcnt))
+		return;
+free_now:
+	kmem_cache_free(skbuff_ext_cache, ext);
+}
+EXPORT_SYMBOL(__skb_ext_put);
+#endif /* CONFIG_SKB_EXTENSIONS */

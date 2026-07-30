@@ -245,6 +245,24 @@ STANDARD_PARAM_DEF(long,	long,			"%li",  kstrtol);
 STANDARD_PARAM_DEF(ulong,	unsigned long,		"%lu",  kstrtoul);
 STANDARD_PARAM_DEF(ullong,	unsigned long long,	"%llu", kstrtoull);
 
+int param_set_uint_minmax(const char *val, const struct kernel_param *kp,
+		unsigned int min, unsigned int max)
+{
+	unsigned int num;
+	int ret;
+
+	if (!val)
+		return -EINVAL;
+	ret = kstrtouint(val, 0, &num);
+	if (ret)
+		return ret;
+	if (num < min || num > max)
+		return -EINVAL;
+	*((unsigned int *)kp->arg) = num;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(param_set_uint_minmax);
+
 int param_set_charp(const char *val, const struct kernel_param *kp)
 {
 	if (strlen(val) > 1024) {
@@ -850,15 +868,13 @@ static void __init version_sysfs_builtin(void)
 {
 	const struct module_version_attribute **p;
 	struct module_kobject *mk;
-	int err;
 
 	for (p = __start___modver; p < __stop___modver; p++) {
 		const struct module_version_attribute *vattr = *p;
 
 		mk = locate_module_kobject(vattr->module_name);
 		if (mk) {
-			err = sysfs_create_file(&mk->kobj, &vattr->mattr.attr);
-			WARN_ON_ONCE(err);
+			sysfs_create_file(&mk->kobj, &vattr->mattr.attr);
 			kobject_uevent(&mk->kobj, KOBJ_ADD);
 			kobject_put(&mk->kobj);
 		}

@@ -57,6 +57,7 @@ realview_gic_of_init(struct device_node *node, struct device_node *parent)
 
 	/* The PB11MPCore GIC needs to be configured in the syscon */
 	map = syscon_node_to_regmap(np);
+	of_node_put(np);
 	if (!IS_ERR(map)) {
 		/* new irq mode with no DCC */
 		regmap_write(map, REALVIEW_SYS_LOCK_OFFSET,
@@ -65,7 +66,7 @@ realview_gic_of_init(struct device_node *node, struct device_node *parent)
 				   PLD_INTMODE_NEW_NO_DCC,
 				   PLD_INTMODE_MASK);
 		regmap_write(map, REALVIEW_SYS_LOCK_OFFSET, 0x0000);
-		pr_info("RealView GIC: set up interrupt controller to NEW mode, no DCC\n");
+		pr_debug("RealView GIC: set up interrupt controller to NEW mode, no DCC\n");
 	} else {
 		pr_err("RealView GIC setup: could not find syscon\n");
 		return -ENODEV;

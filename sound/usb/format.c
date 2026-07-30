@@ -52,8 +52,12 @@ static u64 parse_audio_format_i_type(struct snd_usb_audio *chip,
 	case UAC_VERSION_1:
 	default: {
 		struct uac_format_type_i_discrete_descriptor *fmt = _fmt;
-		if (format >= 64)
-			return 0; /* invalid format */
+		if (format >= 64) {
+			usb_audio_info(chip,
+				       "%u:%d: invalid format type %#x is detected, processed as PCM\n",
+				       fp->iface, fp->altsetting, format);
+			format = UAC_FORMAT_TYPE_I_PCM;
+		}
 		sample_width = fmt->bBitResolution;
 		sample_bytes = fmt->bSubframeSize;
 		format = 1 << format;
@@ -312,6 +316,19 @@ static int parse_uac2_sample_rate_range(struct snd_usb_audio *chip,
 		}
 
 		for (rate = min; rate <= max; rate += res) {
+
+		/*K19S  code for HQ-161345 by zhangbing at 2021.11.03 start*/
+               if(chip->usb_id == USB_ID(0x12D1, 0x3A07)) {
+ 		pr_info("%s format=0x%x, rate=%d\n", __func__, fp->formats, rate);
+
+               {
+                                if (!(fp->formats & (SNDRV_PCM_FORMAT_U16_BE | SNDRV_PCM_FORMAT_U16_LE | SNDRV_PCM_FORMAT_S16_LE | SNDRV_PCM_FORMAT_S16_BE)))
+                                        break;
+                                if (rate > 48000)
+                                        break;
+               }
+              }
+		/*K19S  code for HQ-161345 by zhangbing at 2021.11.03 end */
 			/* Filter out invalid rates on Focusrite devices */
 			if (USB_ID_VENDOR(chip->usb_id) == 0x1235 &&
 			    !focusrite_valid_sample_rate(chip, fp, rate))

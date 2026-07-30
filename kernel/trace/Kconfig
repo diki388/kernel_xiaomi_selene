@@ -102,6 +102,11 @@ config TRACING
 	select EVENT_TRACING
 	select TRACE_CLOCK
 
+config TRACE_PRINTK
+	bool "Enable trace_printk()"
+	depends on TRACING
+	default n
+
 config GENERIC_TRACER
 	bool
 	select TRACING
@@ -180,6 +185,7 @@ config PREEMPTIRQ_EVENTS
 	bool "Enable trace events for preempt and irq disable/enable"
 	select TRACE_IRQFLAGS
 	depends on DEBUG_PREEMPT || !PROVE_LOCKING
+	depends on TRACING
 	default n
 	help
 	  Enable tracing of disable and enable events for preemption and irqs.

@@ -1509,6 +1509,26 @@ static int mtk_hdmi_dt_parse_pdata(struct mtk_hdmi *hdmi,
 	}
 	of_node_put(ep);
 
+	ep = of_get_child_by_name(port, "endpoint");
+	if (!ep) {
+		dev_err(dev, "Missing endpoint node in port %s\n",
+			port->full_name);
+		of_node_put(port);
+		ret = -EINVAL;
+		goto put_device;
+	}
+	of_node_put(port);
+
+	remote = of_graph_get_remote_port_parent(ep);
+	if (!remote) {
+		dev_err(dev, "Missing connector/bridge node for endpoint %s\n",
+			ep->full_name);
+		of_node_put(ep);
+		ret = -EINVAL;
+		goto put_device;
+	}
+	of_node_put(ep);
+
 	if (!of_device_is_compatible(remote, "hdmi-connector")) {
 		hdmi->bridge.next = of_drm_find_bridge(remote);
 		if (!hdmi->bridge.next) {

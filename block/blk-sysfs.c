@@ -644,7 +644,7 @@ static struct queue_sysfs_entry queue_rq_affinity_entry = {
 };
 
 static struct queue_sysfs_entry queue_iostats_entry = {
-	.attr = {.name = "iostats", .mode = S_IRUGO | S_IWUSR },
+	.attr = {.name = "iostats", .mode = S_IRUGO },
 	.show = queue_show_iostats,
 	.store = queue_store_iostats,
 };
@@ -938,12 +938,17 @@ unlock:
 	mutex_unlock(&q->sysfs_lock);
 	return ret;
 }
+EXPORT_SYMBOL_GPL(blk_register_queue);
 
 void blk_unregister_queue(struct gendisk *disk)
 {
 	struct request_queue *q = disk->queue;
 
 	if (WARN_ON(!q))
+		return;
+
+	/* Return early if disk->queue was never registered. */
+	if (!test_bit(QUEUE_FLAG_REGISTERED, &q->queue_flags))
 		return;
 
 	mutex_lock(&q->sysfs_lock);

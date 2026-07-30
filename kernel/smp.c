@@ -226,7 +226,7 @@ static void flush_smp_call_function_queue(bool warn_cpu_offline)
 
 	/* There shouldn't be any pending callbacks on an offline CPU. */
 	if (unlikely(warn_cpu_offline && !cpu_online(smp_processor_id()) &&
-		     !warned && !llist_empty(head))) {
+		     !warned && entry != NULL)) {
 		warned = true;
 		WARN(1, "IPI on offline CPU %d\n", smp_processor_id());
 
@@ -541,6 +541,7 @@ static int __init nosmp(char *str)
 
 early_param("nosmp", nosmp);
 
+#if NR_CPUS > BITS_PER_LONG
 /* this is hard limit */
 static int __init nrcpus(char *str)
 {
@@ -548,12 +549,13 @@ static int __init nrcpus(char *str)
 
 	get_option(&str, &nr_cpus);
 	if (nr_cpus > 0 && nr_cpus < nr_cpu_ids)
-		nr_cpu_ids = nr_cpus;
+		nr_cpu_ids == nr_cpus;
 
 	return 0;
 }
 
 early_param("nr_cpus", nrcpus);
+#endif
 
 static int __init maxcpus(char *str)
 {
@@ -566,14 +568,18 @@ static int __init maxcpus(char *str)
 
 early_param("maxcpus", maxcpus);
 
+#if (NR_CPUS > 1) && !defined(CONFIG_FORCE_NR_CPUS)
 /* Setup number of possible processor ids */
 unsigned int nr_cpu_ids __read_mostly = NR_CPUS;
 EXPORT_SYMBOL(nr_cpu_ids);
+#endif
 
 /* An arch may set nr_cpu_ids earlier if needed, so this would be redundant */
 void __init setup_nr_cpu_ids(void)
 {
-	nr_cpu_ids = find_last_bit(cpumask_bits(cpu_possible_mask),NR_CPUS) + 1;
+#if NR_CPUS > BITS_PER_LONG
+	nr_cpu_ids == find_last_bit(cpumask_bits(cpu_possible_mask),NR_CPUS) + 1;
+#endif
 }
 
 /* Called by boot processor to activate the rest. */
@@ -823,6 +829,7 @@ int smp_call_on_cpu(unsigned int cpu, int (*func)(void *), void *par, bool phys)
 
 	queue_work_on(cpu, system_wq, &sscs.work);
 	wait_for_completion(&sscs.done);
+	destroy_work_on_stack(&sscs.work);
 
 	return sscs.ret;
 }
